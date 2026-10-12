@@ -14,7 +14,7 @@ spray, poison clouds, snow, in-game cutscenes, subtitles and message boxes, door
 rooms, the sniper scope and the self-destruct countdown (GameCube also the Battle Game timer). Menus,
 inventory, map and FMVs stay at 30. About one extra frame (16 ms) of display latency.
 
-## Downloads
+## Downloads & Installing
 
 Get the ready-to-use files from the **Releases** page:
 
@@ -24,6 +24,10 @@ Get the ready-to-use files from the **Releases** page:
 Each zip has one folder per region with a ready-made file (Dolphin game settings `.ini` / PCSX2 `.pnach`)
 and the same code as plain text to add by hand, plus a README with install steps. The generated codes are
 also in this repository: `cvx60_ar.txt` (GC PAL), `cvx60_usa_ar.txt` (GC USA), `cvx60_jpn_ar.txt` (GC Japan).
+
+You simply open the correct folder for your region of the game, and copy the .ini file (GameCube) or .pnach
+file (PS2) into the correct folder of your emulator install. There are more specific instructions packaged
+within the downloads.
 
 ### Notes
 
