@@ -16,7 +16,10 @@ sys.path.insert(0, HERE)
 from dmem import Mem  # noqa: E402
 from elftools.elf.elffile import ELFFile  # noqa: E402
 
-R13 = 0x804F50A0
+# region: CVX_GID=GCDP08 (default) | GCDE08 | GCDJ08 -> r13 base, ticks/retrace offsets
+GID = os.environ.get("CVX_GID", "GCDP08")
+R13, O_TICKS, O_RETRACE = {"GCDP08": (0x804F50A0, 0x730C, 0x6F4C), "GCDE08": (0x804F0AE0, 0x732C, 0x6F74),
+                           "GCDJ08": (0x804F6420, 0x748C, 0x70CC)}[GID]
 _elf = ELFFile(open(os.path.join(HERE, "..", "cvx60.elf"), "rb"))
 SYM = {s.name: s["st_value"] for s in _elf.get_section_by_name(".symtab").iter_symbols() if s.name}
 D = SYM["cvx_D"]
@@ -30,8 +33,8 @@ def dfield(name):
 
 def snapshot(m):
     v = dict(zip(D_FIELDS, m.u32s(D, len(D_FIELDS))))
-    v["ticks"] = m.u32(R13 - 0x730C)
-    v["vi"] = m.u32(R13 - 0x6F4C)
+    v["ticks"] = m.u32(R13 - O_TICKS)
+    v["vi"] = m.u32(R13 - O_RETRACE)
     return v
 
 
@@ -84,7 +87,7 @@ def camlog(m, secs):
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "stats"
     arg = sys.argv[2] if len(sys.argv) > 2 else None
-    m = Mem(write=cmd in ("on", "off", "blank", "pad", "press"))
+    m = Mem(game_id=GID.encode(), write=cmd in ("on", "off", "blank", "pad", "press"))
     if cmd == "stats":
         stats(m, float(arg or 3))
     elif cmd in ("on", "off"):

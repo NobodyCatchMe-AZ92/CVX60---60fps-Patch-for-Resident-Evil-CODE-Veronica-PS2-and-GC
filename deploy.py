@@ -1,15 +1,16 @@
 """Insert/update the CVX60 AR code in Dolphin's GCDP08.ini, touching nothing else.
-usage: deploy.py [--usa] [--enable | --disable | --remove]"""
+usage: deploy.py [--usa | --jpn] [--enable | --disable | --remove]"""
 import os, sys
 
 USA = "--usa" in sys.argv
-INI = os.path.expanduser(r"~\Documents\Dolphin Emulator\GameSettings\%s.ini" % ("GCDE08" if USA else "GCDP08"))
+JPN = "--jpn" in sys.argv
+INI = os.path.expanduser(r"~\Documents\Dolphin Emulator\GameSettings\%s.ini" % ("GCDJ08" if JPN else "GCDE08" if USA else "GCDP08"))
 NAME = "$60 FPS (interpolated) [CVX60]"
-codes = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ("cvx60_usa_ar.txt" if USA else "cvx60_ar.txt"))).read().split()
+codes = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ("cvx60_jpn_ar.txt" if JPN else "cvx60_usa_ar.txt" if USA else "cvx60_ar.txt"))).read().split()
 codes = [f"{codes[i]} {codes[i + 1]}" for i in range(0, len(codes), 2)]
 mode = next((a for a in sys.argv[1:] if a in ("--enable", "--disable", "--remove")), "--enable")
 
-text = open(INI, encoding="utf-8").read().replace("\r\n", "\n")
+text = open(INI, encoding="utf-8").read().replace("\r\n", "\n") if os.path.exists(INI) else ""
 sections, order, cur = {}, [], None
 for line in text.split("\n"):
     s = line.strip()

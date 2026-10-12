@@ -48,11 +48,15 @@ typedef float f32;
 #define bhDrawScreenFade FN(A_bhDrawScreenFade, void, void)
 #define bhDrawCinesco FN(A_bhDrawCinesco, void, void)
 #define njSetBlendState FN(A_njSetBlendState, void, int, int, int)
+#define bhDrawCountdown FN(A_bhDrawCountdown, void, f32, f32 *, int, int, int)
+#define bhCkFlg FN(A_bhCkFlg, int, void *, int)
+#define bhDrawScope FN(A_bhDrawScope, void, void)
 #define SetCopyFilter FN(A_SetCopyFilter, void, int)
 #define GetDrawXfb FN(A_GetDrawXfb, void *, void)
 #define GXCopyDisp FN(A_GXCopyDisp, void, void *, int)
 #define GXDrawDone FN(A_GXDrawDone, void, void)
-#define TakeSkipFlip FN(A_TakeSkipFlip, int, int)
+#define njSin FN(A_njSin, f32, int)
+#define njCos FN(A_njCos, f32, int)
 #define VISetNextFrameBuffer FN(A_VISetNextFrameBuffer, void, void *)
 #define SwapXfb FN(A_SwapXfb, void, void)
 #define CriServer FN(A_CriServer, void, void)
@@ -64,7 +68,20 @@ typedef float f32;
 extern void PutModelOrig(u8 *ewP);
 
 /* ---- state (.bss) ---- */
-#if defined(CVX_USA)
+#if defined(CVX_JPN)
+/* JPN leaves only ~38KB above its heaps (0x817F6000-0x817FF800): smaller pools than USA. */
+#define MAXENT 40
+#ifdef CVX_LAB
+#define POOLMTX 104   /* lab harness + traces need ~2.4KB */
+#else
+#define POOLMTX 136
+#endif
+#define EF_SAVE_MAX 64
+#define TRACE_N 16
+#define CAMLOG_N 16
+#define PTCL_SLOTS 8
+#define PTCL_N 32
+#elif defined(CVX_USA)
 /* USA leaves only ~49KB above its heaps (0x817F34C0-0x817FF800): smaller pools; models that don't fit are
  * simply drawn exact. PLAYER_RESERVE keeps room for the player, who is drawn after the enemies. */
 #define MAXENT 48
@@ -72,12 +89,16 @@ extern void PutModelOrig(u8 *ewP);
 #define EF_SAVE_MAX 128
 #define TRACE_N 32
 #define CAMLOG_N 32
+#define PTCL_SLOTS 16
+#define PTCL_N 32
 #else
 #define MAXENT 96
 #define POOLMTX 640
 #define EF_SAVE_MAX 256
 #define TRACE_N 256
 #define CAMLOG_N 128
+#define PTCL_SLOTS 32
+#define PTCL_N 48
 #endif
 #define PLAYER_RESERVE 40
 typedef struct {
@@ -89,6 +110,7 @@ typedef struct {
 
 static struct {
     u32 tick;
+    u32 fe_tick;   /* S.tick when the main-loop hook last ran */
     int interp;          /* this tick's draw is interpolated */
     int phase;           /* 1 while drawing the exact extra frame */
     int cam_ok;
@@ -155,10 +177,22 @@ struct { u32 tick; int ncut; f32 dt, dr; u32 dec; int pers; } cvx_cl[CAMLOG_N];
 #endif
 extern u32 __bss_start[], __bss_end[];
 u32 cvx_build_seen;
+/* Dolphin's JIT keeps code it already compiled even after the AR code rewrites those instructions, so
+ * when the code is enabled mid-game or a savestate without hooks is loaded, a hook can stay invisible
+ * (seen: the main loop's njWaitVSync call, compiled before the first AR pass). icbi makes the JIT drop
+ * and recompile those spots from RAM. */
+static const u32 HOOK_SITES[] = {A_SITE_MAIN_WAITVSYNC, A_SITE_MS_CONTROLLIGHT, A_SITE_MS_ALLDRAW,
+                                 A_SITE_MS_MIRRORDRAW, A_SITE_MS_EASYDRAW, A_bhPutModel, A_SITE_DOOR_CONTROLDOOR};
+static void hooks_flush(void) {
+    for (u32 i = 0; i < sizeof(HOOK_SITES) / sizeof(HOOK_SITES[0]); i++)
+        __asm__ volatile("dcbst 0,%0; sync; icbi 0,%0" : : "r"(HOOK_SITES[i]) : "memory");
+    __asm__ volatile("sync; isync" : : : "memory");
+}
 static inline void state_check(void) {
     if (cvx_build_seen == CVX_BUILD_ID) return;
     for (u32 *p = __bss_start; p < __bss_end; p++) *p = 0;
     cvx_build_seen = CVX_BUILD_ID;
+    hooks_flush();
 }
 
 /* ---- math ---- */
@@ -265,7 +299,7 @@ static u32 interp_block(void) {
     if (act & ~TASKS_OK) why |= 1u << 2;                                      /* other task running */
     if (SYS32(0x44) & 0x80000000u) why |= 1u << 3;                            /* pause */
     if (SYS32(0x64) & 0x100u) why |= 1u << 5;                                 /* mirror */
-    if (SYS32(0x64) & (0x800000u | 0x40000000u)) why |= 1u << 6;              /* scope / thermo */
+    if (SYS32(0x64) & 0x40000000u) why |= 1u << 6;                            /* thermometer (animates per call) */
     if (SYS32(0x64) & 0x8u) why |= 1u << 7;                                   /* menu */
     /* gm_flg 0x200 = small render-to-texture (e.g. alarm-light rooms): drawn inside the tick before the
      * main draw, restores the camera itself; frame B just reuses this tick's texture. 0x100 = full-screen
@@ -273,9 +307,7 @@ static u32 interp_block(void) {
     if (SYS32(0x60) & 0x100u) why |= 1u << 8;
     if (SYS32(0x68) & 0x1u) why |= 1u << 9;                                   /* door demo */
     if (SYS32(0x1B060) != 1) why |= 1u << 10;                                 /* loop_ct */
-    if (SYS32(0x1B168) != 0) why |= 1u << 11;                                 /* countdown */
     if (*(volatile unsigned short *)(SYSP + 0x2A550) != 0 || SYSF(0x2A564) > 0.0f) why |= 1u << 12; /* screensaver */
-    if (SYS32(0x90) == 3) why |= 1u << 13;                                    /* battle-game HUD */
     if (DRAW_MODE > 2) why |= 1u << 14;
     if (VSYNC_INTERVAL != 2 || VSYNC_MODE == 0) why |= 1u << 15;
     if (LAB_OFF) why |= 1u << 31;
@@ -290,6 +322,7 @@ void cvx_after_logic(void) {
     state_check();
     bhControlLight();
     S.tick++;
+    if (S.tick - S.fe_tick > 4) { hooks_flush(); S.fe_tick = S.tick; }
     S.interp = can_interp();
     int cur = S.tick & 1, prv = cur ^ 1;
     S.nent[cur] = 0;
@@ -375,6 +408,7 @@ static void trace_player(u8 *ewP, u8 *ow) {
  * GC list layout = PS2 SYS_WORK + 4: {count offset, list offset, capacity}. */
 static const u32 EF_LISTS[][3] = {
     {0x222C0, 0x22AEC, 0x50},  /* ef_mdf: shadows */
+    {0x222BC, 0x222EC, 512},   /* ef_pol: pre-built polygon models (shell casings...), bhDrawPolEffect */
     {0x222C8, 0x2342C, 512},   /* ef_ntx: 3D, no texture blend */
     {0x222CC, 0x23C2C, 512},   /* ef_trs: 3D translucent */
     {0x222D0, 0x2442C, 512},   /* ef_pnc: 3D punch-through */
@@ -383,6 +417,12 @@ static const u32 EF_LISTS[][3] = {
 };
 static struct { u8 *op; f32 p[3]; int a[3]; } ef_save[EF_SAVE_MAX];
 static int ef_n;
+
+static void snow_walk(int restore);
+static int snow_on;
+static void ptcl_mid(void);
+static void blood_walk(int restore);
+static int blood_on;
 
 static void eff_mid(void) {
     ef_n = 0;
@@ -408,10 +448,192 @@ static void eff_mid(void) {
             }
         }
     }
+    snow_walk(0);
+    snow_on = 1;
+    ptcl_mid();
+    blood_walk(0);
+    blood_on = 1;
+}
+
+/* Snow (bhEff219 -> EFF5SNOWRECT, drawn via the ef_fnc list by DrawEff5SnowRect): ExecEff5SnowRect moves
+ * every flake each tick by wind + (0,-0.33,0) + its drift entry pSnowVector[i % 100], then wraps it into a
+ * box around the camera. Frame A draws each flake half a step back. Shifted in place, only where
+ * (p - h) + h == p in float (99.9+%), so the restore is bit-exact and no copy is needed; a bitset
+ * remembers which flakes moved. */
+#define SNOW_MAX 2048
+static u32 snow_bits[SNOW_MAX / 32];
+
+static void snow_walk(int restore) {
+    int n = (int)SYS32(0x222E8);   /* ef_fncn */
+    if (n > 128) n = 128;
+    u8 **list = (u8 **)(SYSP + 0x2622C);
+    int bit = 0;
+    for (int i = 0; i < n; i++) {
+        u8 *op = list[i];
+        if (!op || *(u32 *)(op + 0x4C4) != A_DrawEff5SnowRect) continue;
+        u8 *sn = *(u8 **)(op + 0x2F0);
+        if (!sn) continue;
+        f32 w[3];
+        /* = GetEff5SnowRectCurrentWindVector (inlined everywhere in the JPN build): sys->windr +0x22260, winds +0x22264 */
+        int windr = (int)SYS32(0x22260);
+        f32 winds = SYSF(0x22264);
+        w[0] = winds * -njSin(windr) / 10.0f;
+        w[1] = 0.0f;
+        w[2] = winds * -njCos(windr) / 10.0f;
+        w[1] -= 0.33f;
+        f32 *vec = *(f32 **)(sn + 0xE0);
+        int rest = *(int *)(sn + 0xE8);
+        for (int g = 0; g < 20 && rest > 0; g++) {
+            f32 *pt = *(f32 **)(sn + 0x3C + g * 8);
+            int m = *(int *)(sn + 0x40 + g * 8);
+            if (m > rest) m = rest;
+            rest -= m;
+            for (int k = 0; k < m && bit < SNOW_MAX; k++, bit++, pt += 3) {
+                f32 h0 = 0.5f * (w[0] + vec[k * 3]), h1 = 0.5f * (w[1] + vec[k * 3 + 1]), h2 = 0.5f * (w[2] + vec[k * 3 + 2]);
+                u32 mask = 1u << (bit & 31);
+                if (restore) {
+                    if (snow_bits[bit >> 5] & mask) { pt[0] += h0; pt[1] += h1; pt[2] += h2; }
+                    continue;
+                }
+                f32 q0 = pt[0] - h0, q1 = pt[1] - h1, q2 = pt[2] - h2;
+                if (q0 + h0 == pt[0] && q1 + h1 == pt[1] && q2 + h2 == pt[2]) {
+                    pt[0] = q0; pt[1] = q1; pt[2] = q2;
+                    snow_bits[bit >> 5] |= mask;
+                } else {
+                    snow_bits[bit >> 5] &= ~mask;
+                }
+            }
+        }
+    }
+}
+static int snow_on;
+
+/* Particle clouds (P_WRK via op->exp0, e.g. the moths' poison spray, blood/dust bursts), drawn from the ef_fnc
+ * list by bhEff_E00_DrawParticleSpr/Ply straight from pos[] (+0x1C, up to 48, count +0x10). Each tick moves
+ * every particle by its velocity plus a random jitter, so the previous position can't be derived: keep last
+ * tick's positions per cloud, draw frame A at the midpoint, then put the exact values back from the copy. */
+typedef struct { u8 *pp; u32 tick; int num, used; f32 p[PTCL_N][3]; } Ptcl;
+static Ptcl ptcl[PTCL_SLOTS];
+
+static void ptcl_mid(void) {
+    int n = (int)SYS32(0x222E8);   /* ef_fncn */
+    if (n > 128) n = 128;
+    u8 **list = (u8 **)(SYSP + 0x2622C);
+    for (int i = 0; i < n; i++) {
+        u8 *op = list[i];
+        if (!op) continue;
+        u32 fn = *(u32 *)(op + 0x4C4);
+        if (fn != A_bhEff_E00_DrawParticleSpr && fn != A_bhEff_E00_DrawParticlePly) continue;
+        u8 *pp = *(u8 **)(op + 0x2F0);
+        if (!pp) continue;
+        int num = *(int *)(pp + 0x10);
+        if (num <= 0 || num > PTCL_N) continue;
+        Ptcl *sl = 0, *fr = 0;
+        for (int k = 0; k < PTCL_SLOTS; k++) {
+            if (ptcl[k].pp == pp) { sl = &ptcl[k]; break; }
+            if (!fr && (!ptcl[k].pp || S.tick - ptcl[k].tick > 1)) fr = &ptcl[k];
+        }
+        int cont = sl && sl->tick == S.tick - 1 && sl->num == num;
+        if (!sl) sl = fr;
+        if (!sl || sl->used) continue;   /* no room (or listed twice): drawn exact */
+        f32 *pos = (f32 *)(pp + 0x1C);
+        for (int j = 0; j < num; j++) {
+            f32 *c = pos + j * 3, *o = sl->p[j];
+            f32 c0 = c[0], c1 = c[1], c2 = c[2];
+            if (cont) {
+                f32 dx = c0 - o[0], dy = c1 - o[1], dz = c2 - o[2];
+                if (dx * dx + dy * dy + dz * dz < 3.0f * 3.0f) {
+                    c[0] = 0.5f * (o[0] + c0); c[1] = 0.5f * (o[1] + c1); c[2] = 0.5f * (o[2] + c2);
+                }
+            }
+            o[0] = c0; o[1] = c1; o[2] = c2;
+        }
+        sl->pp = pp; sl->num = num; sl->tick = S.tick; sl->used = 1;
+    }
+}
+
+static void ptcl_restore(void) {
+    for (int k = 0; k < PTCL_SLOTS; k++) {
+        if (!ptcl[k].used) continue;
+        ptcl[k].used = 0;
+        f32 *pos = (f32 *)(ptcl[k].pp + 0x1C);
+        for (int j = 0; j < ptcl[k].num; j++) { pos[j * 3] = ptcl[k].p[j][0]; pos[j * 3 + 1] = ptcl[k].p[j][1]; pos[j * 3 + 2] = ptcl[k].p[j][2]; }
+    }
+}
+
+/* Blood spray (bhEff302 -> E02_WORK via op->exp0, drawn from ef_fnc by bhEff_PtclSpriteDrawB): up to 6 stages of
+ * 16 points. Each tick bhEff302 moves point k (counted from stage stg_stt) by dir[(vtx_num-1-k) & 15] * spd + the
+ * stage's gravity (already updated), then spd += accel; stage scale grows by scl_add_1st/2nd. All deterministic,
+ * so frame A shifts each point half a step back in place (exact-restore check + bitset, like the snow) and
+ * the scale half an add; a stage spawned this tick (stg_tim == 1) stays exact. GC E02_WORK = PS2 layout with a
+ * 0x80-byte attr backup (fields from 0xD4 on are PS2 - 0x40). */
+#define BLOOD_MAX 8
+static u8 *bl_e[BLOOD_MAX];
+static u32 bl_bits[BLOOD_MAX][3];
+static f32 bl_scl[BLOOD_MAX][6];
+static int bl_n;
+
+static void blood_walk(int restore) {
+    if (!restore) {
+        bl_n = 0;
+        int n = (int)SYS32(0x222E8);
+        if (n > 128) n = 128;
+        u8 **list = (u8 **)(SYSP + 0x2622C);
+        for (int i = 0; i < n && bl_n < BLOOD_MAX; i++) {
+            u8 *op = list[i];
+            if (!op || *(u32 *)(op + 0x4C4) != A_bhEff_PtclSpriteDrawB) continue;
+            u8 *e = *(u8 **)(op + 0x2F0);
+            if (e) bl_e[bl_n++] = e;
+        }
+    }
+    for (int b = 0; b < bl_n; b++) {
+        u8 *e = bl_e[b];
+        int stt = *(int *)(e + 4), num = *(int *)(e + 8), vn = *(int *)(e + 0xC), erase = *(int *)(e + 0x20);
+        if (stt < 0 || num <= 0 || stt + num > 6 || vn != num * 16) continue;
+        f32 accel = *(f32 *)(e + 0x1C);
+        const f32 *dir = (const f32 *)(e + 0x164);
+        int k = 0;
+        for (int st = stt; st < stt + num; st++) {
+            int tim = *(int *)(e + 0xEC + st * 4);
+            const f32 *grv = (const f32 *)(e + 0x11C + st * 12);
+            f32 *pos = *(f32 **)(e + 0x104 + st * 4);
+            const f32 *spd = *(f32 **)(e + 0x224 + st * 4);
+            f32 *scl = (f32 *)(e + 0x3EC + st * 4);
+            int fresh = tim <= 1;
+            if (restore) *scl = bl_scl[b][st];
+            else {
+                bl_scl[b][st] = *scl;
+                int tb = tim - 1;
+                if (!fresh && tb < erase) *scl -= 0.5f * *(f32 *)(e + ((tb < erase / 2) ? 0x404 : 0x408));
+            }
+            for (int j = 0; j < 16; j++, k++, pos += 3) {
+                int bit = st * 16 + j;
+                u32 mask = 1u << (bit & 31), *w = &bl_bits[b][bit >> 5];
+                if (fresh) { if (!restore) *w &= ~mask; continue; }
+                const f32 *d = dir + ((vn - 1 - k) & 15) * 3;
+                f32 su = spd[j] - accel;
+                f32 h0 = 0.5f * (d[0] * su + grv[0]), h1 = 0.5f * (d[1] * su + grv[1]), h2 = 0.5f * (d[2] * su + grv[2]);
+                if (restore) {
+                    if (*w & mask) { pos[0] += h0; pos[1] += h1; pos[2] += h2; }
+                    continue;
+                }
+                f32 q0 = pos[0] - h0, q1 = pos[1] - h1, q2 = pos[2] - h2;
+                if (q0 + h0 == pos[0] && q1 + h1 == pos[1] && q2 + h2 == pos[2]) {
+                    pos[0] = q0; pos[1] = q1; pos[2] = q2;
+                    *w |= mask;
+                } else {
+                    *w &= ~mask;
+                }
+            }
+        }
+    }
 }
 
 /* reverse order, so an effect queued in two lists ends up with its true values */
 static void eff_restore(void) {
+    ptcl_restore();
+    if (blood_on) { blood_walk(1); blood_on = 0; }
+    if (snow_on) { snow_walk(1); snow_on = 0; }
     while (ef_n > 0) {
         ef_n--;
         u8 *op = ef_save[ef_n].op;
@@ -684,7 +906,14 @@ static void draw_only(void) {
     case 1: bhEtcMirrorDrawModel(); break;
     case 2: bhAllEasyDrawModel(); break;
     }
+    /* sniper scope overlay (tint, reticle, zoom readout from cam.pers): drawn by bhMainSequence right
+     * after the models; pure 2D, uses this tick's zoom */
+    if (SYS32(0x64) & 0x800000u) {
+        CAM_PERS = S.pers[S.tick & 1];
+        bhDrawScope();
+    }
     copy12(cm, live);
+    CAM_PERS = pers_live;
     njSetPerspective(pers_live);
     PL_SLEEP = sleep;
     draw_message();
@@ -694,6 +923,31 @@ static void draw_only(void) {
         bhDrawScreenFade();
     }
     if (SYSF(0x2A588) > 0.0f) bhDrawCinesco();
+    /* self-destruct countdown: the draw half of bhSysCallScreenSaver's timer block (its voice
+     * callouts stay in the tick); every call below only submits geometry */
+    int cd = (int)SYS32(0x1B168);
+    if (cd != 0 && (SYS32(0x74) & 0x200u) && (SYS32(0x44) & 0x40u)) {
+        const f32 *k = (const f32 *)A_COUNTDOWN_POS;   /* x, y, scale */
+        f32 pos[2] = {k[0], k[1]};
+        njSetBlendState(1, 7, 0);
+        if (!bhCkFlg(SYSP + 0x194, 0x15D))
+            bhDrawCountdown(k[2], pos, 7, cd, cd < (int)SYS32(0x1B16C) ? 2 : 3);
+        njSetBlendState(1, 3, 1);
+    }
+    /* Battle Game timer: same routine, drawn right after the countdown block */
+    if (SYS32(0x90) == 3 && (SYS32(0x74) & 0x200u) && !(SYS32(0x5C) & 0x80u) && (SYS32(0x60) & 0x80000000u)) {
+        const f32 *k = (const f32 *)A_COUNTDOWN_POS;
+        f32 pos[2] = {k[0], k[1]};
+        bhDrawCountdown(k[2], pos, 7, (int)SYS32(0x8A4), 3);
+    }
+}
+
+/* TakeSkipFlip(v): returns the "skip next flip" flag and stores v (PAL/USA: a 4-instruction function,
+ * JPN: inlined), so read/write the global directly on every region. */
+static inline int TakeSkipFlip(int v) {
+    int o = (int)G32(O_SKIP_FLIP);
+    G32(O_SKIP_FLIP) = (u32)v;
+    return o;
 }
 
 static void wait_until(u32 target) {
@@ -834,6 +1088,7 @@ static void frame_end(void) {
  * remember the time so frame A's copy phase can be measured. */
 void cvx_frame_end(void) {
     state_check();
+    S.fe_tick = S.tick;
     frame_end();
     S.tb_tick = tbl();
 }
